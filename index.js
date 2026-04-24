@@ -1,31 +1,66 @@
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
+const cors = require('cors');
 require('dotenv').config();
 
 const app = express();
+
+// Middleware
+app.use(cors());
 app.use(express.json());
 
-// Initialize Supabase. 
-// Note: If this backend is just an API wrapper, you might use the Service Role key here to bypass RLS, 
-// but it is safer to pass the user's JWT token from the frontend to act on their behalf.
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+// Initialize Supabase with service role for backend operations
+const supabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_KEY
+);
 
 // ==========================================
-// 1. Start or Find a Chat Room
+// 1. GET ALL USERS (NEW ENDPOINT)
+// ==========================================
+app.get('/api/users', async (req, res) => {
+    try {
+        const { search } = req.query;
+        
+        let query = supabase
+            .from('profiles')
+            .select('id, username, created_at')
+            .order('username', { ascending: true });
+        
+        if (search) {
+            query = query.ilike('username', `%${search}%`);
+        }
+        
+        const { data: users, error } = await query;
+        
+        if (error) throw error;
+        
+        res.status(200).json({ users });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ==========================================
+// 2. START OR FIND CHAT ROOM
 // ==========================================
 app.post('/api/chat/start', async (req, res) => {
     const { userA_id, userB_id } = req.body;
 
+    if (!userA_id || !userB_id) {
+        return res.status(400).json({ error: 'Both user IDs are required' });
+    }
+
     try {
-        // Step A: Check if a room already exists between these two users.
-        // We look for a room where both users are participants.
+        // Find existing room
         const { data: existingRooms, error: searchError } = await supabase
             .from('participants')
             .select('room_id')
             .in('user_id', [userA_id, userB_id]);
 
-        // Logic to find a room_id that appears exactly twice in our search
-        // (meaning both userA and userB are in it)
+        if (searchError) throw searchError;
+
+        // Find room with both users
         const roomCounts = {};
         let sharedRoomId = null;
         
@@ -37,10 +72,14 @@ app.post('/api/chat/start', async (req, res) => {
         }
 
         if (sharedRoomId) {
-            return res.status(200).json({ room_id: sharedRoomId, message: "Existing room found" });
+            return res.status(200).json({ 
+                room_id: sharedRoomId, 
+                message: "Existing room found",
+                is_new: false
+            });
         }
 
-        // Step B: If no room exists, create a new one
+        // Create new room
         const { data: newRoom, error: roomError } = await supabase
             .from('rooms')
             .insert([{}])
@@ -49,7 +88,7 @@ app.post('/api/chat/start', async (req, res) => {
 
         if (roomError) throw roomError;
 
-        // Step C: Add both users to the new room
+        // Add participants
         const { error: participantError } = await supabase
             .from('participants')
             .insert([
@@ -59,52 +98,154 @@ app.post('/api/chat/start', async (req, res) => {
 
         if (participantError) throw participantError;
 
-        res.status(201).json({ room_id: newRoom.id, message: "New room created" });
+        res.status(201).json({ 
+            room_id: newRoom.id, 
+            message: "New room created",
+            is_new: true
+        });
 
     } catch (error) {
+        console.error('Error starting chat:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
 // ==========================================
-// 2. Send a Message
+// 3. SEND MESSAGE
 // ==========================================
 app.post('/api/chat/message', async (req, res) => {
     const { room_id, sender_id, content } = req.body;
 
-    // Step A: Insert the message into the database.
-    // (If Realtime is enabled, Supabase will instantly broadcast this to the frontend)
-    const { data: message, error } = await supabase
-        .from('messages')
-        .insert([{ room_id, user_id: sender_id, content }])
-        .select()
-        .single();
+    if (!room_id || !sender_id || !content) {
+        return res.status(400).json({ error: 'Missing required fields' });
+    }
 
-    if (error) return res.status(500).json({ error: error.message });
+    try {
+        // Verify sender is participant of the room
+        const { data: participant, error: participantError } = await supabase
+            .from('participants')
+            .select('id')
+            .eq('room_id', room_id)
+            .eq('user_id', sender_id)
+            .single();
 
-    res.status(201).json({ success: true, message });
+        if (participantError || !participant) {
+            return res.status(403).json({ error: 'Not a participant of this room' });
+        }
+
+        // Insert message
+        const { data: message, error } = await supabase
+            .from('messages')
+            .insert([{ 
+                room_id, 
+                user_id: sender_id, 
+                content: content.trim() 
+            }])
+            .select('id, room_id, user_id, content, created_at')
+            .single();
+
+        if (error) throw error;
+
+        res.status(201).json({ 
+            success: true, 
+            message 
+        });
+
+    } catch (error) {
+        console.error('Error sending message:', error);
+        res.status(500).json({ error: error.message });
+    }
 });
 
 // ==========================================
-// 3. Fetch Chat History
+// 4. GET CHAT HISTORY
 // ==========================================
 app.get('/api/chat/:room_id/history', async (req, res) => {
     const { room_id } = req.params;
+    const { limit = 50, before } = req.query;
 
-    // Step A: Fetch all messages for the room, ordered by time
-    const { data: messages, error } = await supabase
-        .from('messages')
-        .select('id, user_id, content, created_at')
-        .eq('room_id', room_id)
-        .order('created_at', { ascending: true });
+    try {
+        let query = supabase
+            .from('messages')
+            .select('id, user_id, content, created_at')
+            .eq('room_id', room_id)
+            .order('created_at', { ascending: false })
+            .limit(parseInt(limit));
 
-    if (error) return res.status(500).json({ error: error.message });
+        // For pagination
+        if (before) {
+            query = query.lt('created_at', before);
+        }
 
-    res.status(200).json({ messages });
+        const { data: messages, error } = await query;
+
+        if (error) throw error;
+
+        // Reverse to get chronological order
+        const orderedMessages = messages ? messages.reverse() : [];
+
+        res.status(200).json({ 
+            messages: orderedMessages,
+            has_more: messages ? messages.length === parseInt(limit) : false
+        });
+
+    } catch (error) {
+        console.error('Error fetching history:', error);
+        res.status(500).json({ error: error.message });
+    }
 });
 
-// Start the server for your Render deployment
+// ==========================================
+// 5. GET USER'S CHAT ROOMS
+// ==========================================
+app.get('/api/chat/rooms/:user_id', async (req, res) => {
+    const { user_id } = req.params;
+
+    try {
+        const { data: rooms, error } = await supabase
+            .from('participants')
+            .select(`
+                room_id,
+                rooms!inner(id, created_at),
+                user_id
+            `)
+            .eq('user_id', user_id);
+
+        if (error) throw error;
+
+        // Get other participants for each room
+        const roomDetails = await Promise.all(
+            rooms.map(async (room) => {
+                const { data: participants } = await supabase
+                    .from('participants')
+                    .select('user_id, profiles!inner(username)')
+                    .eq('room_id', room.room_id)
+                    .neq('user_id', user_id);
+
+                return {
+                    room_id: room.room_id,
+                    other_user: participants ? participants[0]?.profiles?.username : 'Unknown',
+                    created_at: room.rooms.created_at
+                };
+            })
+        );
+
+        res.status(200).json({ rooms: roomDetails });
+
+    } catch (error) {
+        console.error('Error fetching rooms:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.status(200).json({ status: 'healthy', timestamp: new Date().toISOString() });
+});
+
+// Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Chat API running on port ${PORT}`);
+    console.log(`✨ Chat API running on port ${PORT}`);
+    console.log(`📡 Health check: http://localhost:${PORT}/health`);
 });
